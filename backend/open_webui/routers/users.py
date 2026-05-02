@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _is_admin_user(user: UserModel) -> bool:
+    return user.role == 'admin'
+
+
 ############################
 # GetUsers
 # A house is only as strong as its care for the least of
@@ -121,6 +125,12 @@ async def search_users(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    if not _is_admin_user(user):
+        return {
+            'users': [],
+            'total': 0,
+        }
+
     limit = PAGE_ITEM_COUNT
 
     page = max(1, page)
@@ -436,12 +446,12 @@ async def get_user_by_id(user_id: str, user=Depends(get_admin_user), db: AsyncSe
 async def get_user_info_by_id(
     user_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
-    user = await Users.get_user_by_id(user_id, db=db)
-    if user:
+    target_user = await Users.get_user_by_id(user_id, db=db)
+    if target_user:
         groups = await Groups.get_groups_by_member_id(user_id, db=db)
         return UserInfoResponse(
             **{
-                **user.model_dump(),
+                **target_user.model_dump(),
                 'groups': [{'id': group.id, 'name': group.name} for group in groups],
                 'is_active': await Users.is_user_active(user_id, db=db),
             }
@@ -474,18 +484,18 @@ async def get_user_oauth_sessions_by_id(
 
 @router.get('/{user_id}/profile/image')
 async def get_user_profile_image_by_id(user_id: str, user=Depends(get_verified_user)):
-    user = await Users.get_user_by_id(user_id)
-    if user:
-        if user.profile_image_url:
+    target_user = await Users.get_user_by_id(user_id)
+    if target_user:
+        if target_user.profile_image_url:
             # check if it's url or base64
-            if user.profile_image_url.startswith('http'):
+            if target_user.profile_image_url.startswith('http'):
                 return Response(
                     status_code=status.HTTP_302_FOUND,
-                    headers={'Location': user.profile_image_url},
+                    headers={'Location': target_user.profile_image_url},
                 )
-            elif user.profile_image_url.startswith('data:image'):
+            elif target_user.profile_image_url.startswith('data:image'):
                 try:
-                    header, base64_data = user.profile_image_url.split(',', 1)
+                    header, base64_data = target_user.profile_image_url.split(',', 1)
                     image_data = base64.b64decode(base64_data)
                     image_buffer = io.BytesIO(image_data)
                     media_type = header.split(';')[0].lstrip('data:')

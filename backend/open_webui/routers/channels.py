@@ -2,6 +2,7 @@ import json
 import logging
 import base64
 import io
+import asyncio
 from typing import Optional
 
 
@@ -153,6 +154,59 @@ async def check_channels_access(request: Request, user: Optional[UserModel] = No
             )
 
 
+async def require_admin_channel_management(user: UserModel):
+    if user.role != 'admin':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
+
+
+def _is_admin_user(user: UserModel) -> bool:
+    return user.role == 'admin'
+
+
+def _content_is_text_only(content) -> bool:
+    if content is None:
+        return True
+
+    if isinstance(content, str):
+        return True
+
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                continue
+            if isinstance(item, dict) and item.get('type') == 'text' and isinstance(item.get('text'), str):
+                continue
+            return False
+        return True
+
+    return False
+
+
+def _message_has_user_extras(form_data: MessageForm) -> bool:
+    if not _content_is_text_only(getattr(form_data, 'content', None)):
+        return True
+
+    data = getattr(form_data, 'data', None)
+    if isinstance(data, dict) and any(bool(value) for value in data.values()):
+        return True
+
+    return False
+
+
+async def require_user_text_only_message(user: UserModel, form_data: MessageForm):
+    if _is_admin_user(user):
+        return
+
+    if _message_has_user_extras(form_data):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Only plain text messages are allowed for non-admin users in channels.',
+        )
+
+
 ############################
 # GetChatList
 ############################
@@ -239,6 +293,7 @@ async def get_dm_channel_by_user_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
     try:
         existing_channel = await Channels.get_dm_channel_by_user_ids([user.id, user_id], db=db)
         if existing_channel:
@@ -297,6 +352,7 @@ async def create_new_channel(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
 
     if form_data.type not in ['group', 'dm'] and user.role != 'admin':
         # Only admins can create standard channels (joined by default)
@@ -568,6 +624,7 @@ async def add_members_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -604,6 +661,7 @@ async def remove_members_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -635,6 +693,7 @@ async def update_channel_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -672,6 +731,7 @@ async def delete_channel_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
 
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
@@ -863,8 +923,208 @@ async def send_notification(request, channel, message, active_user_ids, db=None)
     return True
 
 
+def _get_channel_model_id_from_name(channel: ChannelModel, models: dict) -> Optional[str]:
+    channel_name = ((channel.name or '') if channel else '').strip()
+    if not channel_name or not models:
+        return None
+
+    if channel_name in models:
+        return channel_name
+
+    normalized = channel_name
+    for sep in ['—', '–', '_', '|', '/', ':', '：', ' ', '　']:
+        normalized = normalized.replace(sep, '-')
+
+    parts = [part.strip() for part in normalized.split('-') if part.strip()]
+    if not parts:
+        return None
+
+    for part in reversed(parts):
+        if part in models:
+            return part
+
+    lower_models = {model_id.lower(): model_id for model_id in models.keys()}
+    for part in reversed(parts):
+        matched_model_id = lower_models.get(part.lower())
+        if matched_model_id:
+            return matched_model_id
+
+    return None
+
+
+def _extract_text_from_content_block(content) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get('text')
+                if isinstance(text, str):
+                    parts.append(text)
+        return ''.join(parts)
+
+    return ''
+
+
+def _extract_text_from_stream_payload(payload: dict) -> str:
+    texts = []
+
+    for choice in payload.get('choices', []) or []:
+        delta = choice.get('delta') or {}
+        message = choice.get('message') or {}
+
+        delta_content = _extract_text_from_content_block(delta.get('content'))
+        if delta_content:
+            texts.append(delta_content)
+            continue
+
+        message_content = _extract_text_from_content_block(message.get('content'))
+        if message_content:
+            texts.append(message_content)
+
+    return ''.join(texts)
+
+
+async def _stream_model_response_to_channel(
+    request,
+    channel_id: str,
+    response_message,
+    stream_response,
+    user,
+    db=None,
+):
+    streamed_content = ''
+    pushed_content = None
+    buffer = ''
+    loop = asyncio.get_running_loop()
+    last_flush_at = loop.time()
+
+    async for raw_chunk in stream_response.body_iterator:
+        if isinstance(raw_chunk, bytes):
+            raw_chunk = raw_chunk.decode('utf-8', errors='ignore')
+
+        if not raw_chunk:
+            continue
+
+        buffer += raw_chunk
+
+        while "\n\n" in buffer:
+            event, buffer = buffer.split("\n\n", 1)
+
+            for line in event.splitlines():
+                if not line.startswith('data:'):
+                    continue
+
+                data = line[5:].strip()
+                if not data:
+                    continue
+
+                if data == '[DONE]':
+                    continue
+
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                if payload.get('error'):
+                    await update_message_by_id(
+                        request,
+                        channel_id,
+                        response_message.id,
+                        MessageForm(
+                            **{
+                                'content': f"Error: {payload['error']}",
+                                'meta': {
+                                    'done': True,
+                                },
+                            }
+                        ),
+                        user,
+                        db,
+                    )
+                    return
+
+                chunk_text = _extract_text_from_stream_payload(payload)
+                if chunk_text:
+                    streamed_content += chunk_text
+
+                choice = (payload.get('choices') or [{}])[0]
+                finish_reason = choice.get('finish_reason')
+                should_flush = (
+                    streamed_content != pushed_content
+                    and (
+                        pushed_content is None
+                        or len(streamed_content) - len(pushed_content or '') >= 20
+                        or loop.time() - last_flush_at >= 0.1
+                        or bool(finish_reason)
+                    )
+                )
+
+                if should_flush:
+                    await update_message_by_id(
+                        request,
+                        channel_id,
+                        response_message.id,
+                        MessageForm(content=streamed_content),
+                        user,
+                        db,
+                    )
+                    pushed_content = streamed_content
+                    last_flush_at = loop.time()
+
+    if buffer.strip():
+        for line in buffer.splitlines():
+            if not line.startswith('data:'):
+                continue
+            data = line[5:].strip()
+            if not data or data == '[DONE]':
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            chunk_text = _extract_text_from_stream_payload(payload)
+            if chunk_text:
+                streamed_content += chunk_text
+
+    final_content = streamed_content
+    if final_content != pushed_content:
+        await update_message_by_id(
+            request,
+            channel_id,
+            response_message.id,
+            MessageForm(content=final_content),
+            user,
+            db,
+        )
+
+    await update_message_by_id(
+        request,
+        channel_id,
+        response_message.id,
+        MessageForm(
+            **{
+                'content': final_content,
+                'meta': {
+                    'done': True,
+                },
+            }
+        ),
+        user,
+        db,
+    )
+
+
 async def model_response_handler(request, channel, message, user, db=None):
     MODELS = {model['id']: model for model in await get_filtered_models(await get_all_models(request, user=user), user)}
+
+    if message.meta and message.meta.get('model_id'):
+        return False
 
     mentions = extract_mentions(message.content)
     message_content = replace_mentions(message.content)
@@ -885,8 +1145,13 @@ async def model_response_handler(request, channel, message, user, db=None):
         if mention['id_type'] == 'M' and mention['id'] not in model_mentions:
             model_mentions[mention['id']] = mention
 
+    # no mention -> auto-select the model id embedded in the channel name
     if not model_mentions:
-        return False
+        channel_model_id = _get_channel_model_id_from_name(channel, MODELS)
+        if not channel_model_id:
+            return False
+
+        model_mentions[channel_model_id] = {'id': channel_model_id, 'id_type': 'M'}
 
     for mention in model_mentions.values():
         model_id = mention['id']
@@ -894,22 +1159,23 @@ async def model_response_handler(request, channel, message, user, db=None):
 
         if model:
             try:
-                # reverse to get in chronological order
-                thread_messages = (
-                    await Messages.get_messages_by_parent_id(
+                # recent channel history, not thread history
+                channel_messages = (
+                    await Messages.get_messages_by_channel_id(
                         channel.id,
-                        message.parent_id if message.parent_id else message.id,
+                        skip=0,
+                        limit=20,
                         db=db,
                     )
                 )[::-1]
 
+                # no parent_id -> reply is posted as a top-level channel message
                 response_message, channel = await new_message_handler(
                     request,
                     channel.id,
                     MessageForm(
                         **{
-                            'parent_id': (message.parent_id if message.parent_id else message.id),
-                            'content': f'',
+                            'content': '',
                             'data': {},
                             'meta': {
                                 'model_id': model_id,
@@ -921,28 +1187,28 @@ async def model_response_handler(request, channel, message, user, db=None):
                     db,
                 )
 
-                thread_history = []
+                channel_history = []
                 images = []
 
                 # Batch fetch all users in a single query (fixes N+1 problem)
-                user_ids = list({message.user_id for message in thread_messages})
+                user_ids = list({channel_message.user_id for channel_message in channel_messages})
                 message_users = {user.id: user for user in await Users.get_users_by_user_ids(user_ids, db=db)}
 
-                for thread_message in thread_messages:
-                    message_user = message_users.get(thread_message.user_id)
+                for channel_message in channel_messages:
+                    message_user = message_users.get(channel_message.user_id)
 
-                    if thread_message.meta and thread_message.meta.get('model_id', None):
+                    if channel_message.meta and channel_message.meta.get('model_id', None):
                         # If the message was sent by a model, use the model name
-                        message_model_id = thread_message.meta.get('model_id', None)
+                        message_model_id = channel_message.meta.get('model_id', None)
                         message_model = MODELS.get(message_model_id, None)
                         username = message_model.get('name', message_model_id) if message_model else message_model_id
                     else:
                         username = message_user.name if message_user else 'Unknown'
 
-                    thread_history.append(f'{username}: {replace_mentions(thread_message.content)}')
+                    channel_history.append(f'{username}: {replace_mentions(channel_message.content)}')
 
-                    thread_message_files = (thread_message.data or {}).get('files', [])
-                    for file in thread_message_files:
+                    channel_message_files = (channel_message.data or {}).get('files', [])
+                    for file in channel_message_files:
                         if file.get('type', '') == 'image':
                             images.append(file.get('url', ''))
                         elif file.get('content_type', '').startswith('image/'):
@@ -950,13 +1216,13 @@ async def model_response_handler(request, channel, message, user, db=None):
                             if image:
                                 images.append(image)
 
-                thread_history_string = '\n\n'.join(thread_history)
+                channel_history_string = '\n\n'.join(channel_history)
                 system_message = {
                     'role': 'system',
-                    'content': f'You are {model.get("name", model_id)}, participating in a threaded conversation. Be concise and conversational.'
+                    'content': f'You are {model.get("name", model_id)}, participating in a channel conversation. Be concise and conversational.'
                     + (
-                        f"Here's the thread history:\n\n\n{thread_history_string}\n\n\nContinue the conversation naturally as {model.get('name', model_id)}, addressing the most recent message while being aware of the full context."
-                        if thread_history
+                        f"Here's the recent channel history:\n\n\n{channel_history_string}\n\n\nContinue the conversation naturally as {model.get('name', model_id)}, addressing the most recent message while being aware of the full context."
+                        if channel_history
                         else ''
                     ),
                 }
@@ -985,7 +1251,7 @@ async def model_response_handler(request, channel, message, user, db=None):
                         system_message,
                         {'role': 'user', 'content': content},
                     ],
-                    'stream': False,
+                    'stream': True,
                 }
 
                 res = await generate_chat_completion(
@@ -994,7 +1260,16 @@ async def model_response_handler(request, channel, message, user, db=None):
                     user=user,
                 )
 
-                if res:
+                if isinstance(res, StreamingResponse):
+                    await _stream_model_response_to_channel(
+                        request,
+                        channel.id,
+                        response_message,
+                        res,
+                        user,
+                        db,
+                    )
+                elif res:
                     if res.get('choices', []) and len(res['choices']) > 0:
                         await update_message_by_id(
                             request,
@@ -1002,7 +1277,9 @@ async def model_response_handler(request, channel, message, user, db=None):
                             response_message.id,
                             MessageForm(
                                 **{
-                                    'content': res['choices'][0]['message']['content'],
+                                    'content': _extract_text_from_content_block(
+                                        res['choices'][0].get('message', {}).get('content')
+                                    ),
                                     'meta': {
                                         'done': True,
                                     },
@@ -1028,8 +1305,25 @@ async def model_response_handler(request, channel, message, user, db=None):
                             db,
                         )
             except Exception as e:
-                log.info(e)
-                pass
+                log.exception(e)
+                try:
+                    await update_message_by_id(
+                        request,
+                        channel.id,
+                        response_message.id,
+                        MessageForm(
+                            **{
+                                'content': f'Error: {str(e)}',
+                                'meta': {
+                                    'done': True,
+                                },
+                            }
+                        ),
+                        user,
+                        db,
+                    )
+                except Exception:
+                    pass
 
     return True
 
@@ -1116,6 +1410,7 @@ async def post_new_message(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_user_text_only_message(user, form_data)
 
     try:
         message, channel = await new_message_handler(request, id, form_data, user, db)
@@ -1184,6 +1479,13 @@ async def get_channel_message(
 
     if message.channel_id != id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
+
+    if not _is_admin_user(user):
+        if not (message.meta and message.meta.get('model_id')):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail='Only admins can edit channel messages.',
+            )
 
     message_user = await Users.get_user_by_id(message.user_id, db=db)
     return MessageResponse(
@@ -1377,6 +1679,8 @@ async def update_message_by_id(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
     try:
+        if not _is_admin_user(user):
+            await require_user_text_only_message(user, form_data)
         await Messages.update_message_by_id(message_id, form_data, db=db)
         message = await Messages.get_message_by_id(message_id, db=db)
 
@@ -1676,6 +1980,7 @@ async def get_channel_webhooks(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1696,6 +2001,7 @@ async def create_channel_webhook(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1721,6 +2027,7 @@ async def update_channel_webhook(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1749,6 +2056,7 @@ async def delete_channel_webhook(
     db: AsyncSession = Depends(get_async_session),
 ):
     await check_channels_access(request, user)
+    await require_admin_channel_management(user)
     channel = await Channels.get_channel_by_id(id, db=db)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
